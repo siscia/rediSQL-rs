@@ -1,0 +1,14 @@
+[package]
+name = "rediSQL-rst"
+version = "0.1.0"
+authors = ["Simone Mosciatti <simone@redbeardlab.tech>"]
+build = "build.rs"
+
+[build-dependencies]
+bindgen = { git = "https://github.com/servo/rust-bindgen" }
+gcc = "0.3.45"
+
+[dependencies]
+rusqlite = "0.10.1"
+libsqlite3-sys = "0.7.1"
+
