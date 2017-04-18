@@ -1,262 +1,62 @@
-
 extern crate libc;
 
-use std::mem;
-use std::ptr;
 use std::ffi::{CString, CStr};
-
 use std::string;
+
+use std::thread;
+use std::sync::mpsc::{Receiver, RecvError, channel, Sender};
+use std::sync::Arc;
 
 #[allow(dead_code)]
 #[allow(non_snake_case)]
 #[allow(non_camel_case_types)]
 #[allow(non_upper_case_globals)]
+#[allow(improper_ctypes)]
 mod ffi {
-    include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
-
+    include!(concat!(env!("OUT_DIR"), "/bindings_redis.rs"));
 }
 
-#[derive(Debug)]
-enum SQLite3Error {
-    OpenError,
-    StatementError,
-    ExecuteError,
-}
-
-struct RawConnection {
-    db: *mut ffi::sqlite3,
-}
-
-struct Statement {
-    stmt: *mut ffi::sqlite3_stmt,
-}
-
-impl Drop for Statement {
-    fn drop(&mut self) {
-        unsafe {
-            ffi::sqlite3_finalize(self.stmt);
-        }
-    }
-}
-
-impl Drop for RawConnection {
-    fn drop(&mut self) {
-        println!("Connection Drop");
-        unsafe {
-            ffi::sqlite3_close(self.db);
-        }
-    }
-}
-
-fn create_statement(conn: &RawConnection,
-                    query: String)
-                    -> Result<Statement, SQLite3Error> {
-    let raw_query = CString::new(query).unwrap();
-
-    let mut stmt: *mut ffi::sqlite3_stmt = unsafe { mem::uninitialized() };
-    unsafe {
-        let r = ffi::sqlite3_prepare_v2(conn.db,
-                                        raw_query.as_ptr(),
-                                        -1,
-                                        &mut stmt,
-                                        ptr::null_mut());
-        if stmt.is_null() {
-            println!("The statement is null!");
-        }
-        match r {
-            ffi::SQLITE_OK => Ok(Statement { stmt: stmt }),
-            x => {
-                println!("Create error: {}", x);
-                Err(SQLite3Error::StatementError)
-            }
-        }
-    }
-}
-
-fn open_connection(path: String) -> Result<RawConnection, SQLite3Error> {
-    let mut db: *mut ffi::sqlite3 = unsafe { mem::uninitialized() };
-    let c_path = CString::new(path).unwrap();
-    let r = unsafe {
-        let ptr_path = c_path.as_ptr();
-        ffi::sqlite3_open_v2(ptr_path,
-                             &mut db,
-                             ffi::SQLITE_OPEN_CREATE |
-                             ffi::SQLITE_OPEN_READWRITE,
-                             ptr::null())
-    };
-    match r {
-        ffi::SQLITE_OK => Ok(RawConnection { db: db }),
-        x => {
-            println!("Open error: {}", x);
-            return Err(SQLite3Error::OpenError);
-        }
-    }
-}
-
-enum Cursor {
-    OKCursor,
-    DONECursor,
-    RowsCursor {
-        stmt: Statement,
-        num_columns: i32,
-        types: Vec<EntityType>,
-        previous_status: i32,
-    },
-}
-
-fn execute_statement(stmt: Statement) -> Result<Cursor, SQLite3Error> {
-
-    match unsafe { ffi::sqlite3_step(stmt.stmt) } {
-        ffi::SQLITE_OK => Ok(Cursor::OKCursor),
-        ffi::SQLITE_DONE => Ok(Cursor::DONECursor),
-        ffi::SQLITE_ROW => {
-            let n_columns =
-                unsafe { ffi::sqlite3_column_count(stmt.stmt) } as i32;
-            let mut types: Vec<EntityType> = Vec::new();
-            for i in 0..n_columns {
-                types.push(match unsafe {
-                    ffi::sqlite3_column_type(stmt.stmt, i)
-                } {
-                    ffi::SQLITE_INTEGER => EntityType::Integer,
-                    ffi::SQLITE_FLOAT => EntityType::Float,
-                    ffi::SQLITE_TEXT => EntityType::Text,
-                    ffi::SQLITE_BLOB => EntityType::Blob,
-                    ffi::SQLITE_NULL => EntityType::Null,
-                    _ => EntityType::Null,
-                })
-            }
-            Ok(Cursor::RowsCursor {
-                stmt: stmt,
-                num_columns: n_columns,
-                types: types,
-                previous_status: ffi::SQLITE_ROW,
-            })
-        }
-        x => {
-            println!("Exec error: {}", x);
-            return Err(SQLite3Error::ExecuteError);
-        }
-    }
-
-}
-
-enum EntityType {
-    Integer,
-    Float,
-    Text,
-    Blob,
-    Null,
-}
-
-enum Entity {
-    Integer { int: i32 },
-    Float { float: f64 },
-    Text { text: String },
-    Blob { blob: String },
-    Null,
-    OK,
-    DONE,
-}
+mod sqlite;
+use sqlite as sql;
 
 
 trait RedisReply {
     fn reply(&self, ctx: *mut ffi::RedisModuleCtx);
 }
 
-impl RedisReply for Entity {
+impl RedisReply for sql::Entity {
     fn reply(&self, ctx: *mut ffi::RedisModuleCtx) {
         unsafe {
             match *self {
-                Entity::Integer { int } => {
+                sql::Entity::Integer { int } => {
                     ffi::RedisModule_ReplyWithLongLong.unwrap()(ctx,
                                                                 int as i64);
                 }
-                Entity::Float { float } => {
+                sql::Entity::Float { float } => {
                     ffi::RedisModule_ReplyWithDouble.unwrap()(ctx, float);
                 }
-                Entity::Text { ref text } => {
+                sql::Entity::Text { ref text } => {
                     let text_c = CString::new(text.clone()).unwrap();
                     ffi::RedisModule_ReplyWithStringBuffer.unwrap()(ctx, text_c.as_ptr(), text.len());
                 }
-                Entity::Blob { ref blob } => {
+                sql::Entity::Blob { ref blob } => {
                     let blob_c = CString::new(blob.clone()).unwrap();
                     ffi::RedisModule_ReplyWithStringBuffer.unwrap()(ctx, blob_c.as_ptr(), blob.len());
                 }
-                Entity::Null => {
+                sql::Entity::Null => {
                     ffi::RedisModule_ReplyWithNull.unwrap()(ctx);
                 }
-                Entity::OK => {
+                sql::Entity::OK => {
                     let ok = String::from("OK");
                     let ok_c = CString::new(ok.clone()).unwrap();
                     ffi::RedisModule_ReplyWithStringBuffer.unwrap()(ctx, ok_c.as_ptr(), ok.len());
                 }                
-                Entity::DONE => {
+                sql::Entity::DONE => {
                     let done = String::from("DONE");
                     let done_c = CString::new(done.clone()).unwrap();
                     ffi::RedisModule_ReplyWithStringBuffer.unwrap()(ctx,
                                                                     done_c.as_ptr(),
                                                                     done.len());
-                }
-            }
-        }
-    }
-}
-
-type Row = Vec<Entity>;
-
-impl Iterator for Cursor {
-    type Item = Row;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match *self {
-            Cursor::OKCursor => Some(vec![Entity::OK]),
-            Cursor::DONECursor => Some(vec![Entity::DONE]),
-
-            Cursor::RowsCursor { ref stmt,
-                                 num_columns,
-                                 ref types,
-                                 ref mut previous_status } => {
-                match *previous_status {
-                    ffi::SQLITE_ROW => {
-                        let mut result = vec![];
-                        for i in 0..num_columns {
-                            let entity_value =
-                                match types[i as usize] {
-                                    EntityType::Integer => {
-                                        let value =
-                                            unsafe {
-                                                ffi::sqlite3_column_int(stmt.stmt, i)
-                                            };
-                                        Entity::Integer { int: value }
-                                    }
-                                    EntityType::Float => {
-                                        let value = unsafe { ffi::sqlite3_column_double(stmt.stmt, i) };
-                                        Entity::Float { float: value }
-                                    }
-                                    EntityType::Text => {
-                                        let value =
-                                unsafe {
-                                    CStr::from_ptr(ffi::sqlite3_column_text(stmt.stmt, i) as *const i8).to_string_lossy().into_owned()
-                                };
-                                        Entity::Text { text: value }
-                                    }
-                                    EntityType::Blob => {
-                                        let value = 
-                                unsafe { 
-                                    CStr::from_ptr(ffi::sqlite3_column_blob(stmt.stmt, i) as *const i8).to_string_lossy().into_owned() 
-                                };
-                                        Entity::Blob { blob: value }
-                                    }
-                                    EntityType::Null => Entity::Null {},
-                                };
-                            result.push(entity_value);
-                        }
-                        unsafe {
-                            *previous_status = ffi::sqlite3_step(stmt.stmt);
-                        };
-                        Some(result)
-                    }
-                    _ => None,
                 }
             }
         }
@@ -276,11 +76,6 @@ fn create_argument(ctx: *mut ffi::RedisModuleCtx,
     let context = Context { ctx: ctx };
     let argvector = parse_args(argv, argc).unwrap();
     (context, argvector)
-}
-
-#[repr(C)]
-struct db_connection {
-    connection: RawConnection,
 }
 
 struct RedisModuleString {
@@ -336,44 +131,18 @@ extern "C" fn DeleteDB(ctx: *mut ffi::RedisModuleCtx,
                 ffi::RedisModule_ModuleTypeGetType.unwrap()(safe_key.key) &&
                 key_type != ffi::REDISMODULE_KEYTYPE_EMPTY
             } {
-                println!("Get the type ok!");
 
                 let db_ptr = unsafe {
-                    ffi::RedisModule_ModuleTypeGetValue.unwrap()(safe_key.key) as *mut db_connection
+                    ffi::RedisModule_ModuleTypeGetValue.unwrap()(safe_key.key) as *mut DBKey
                 };
 
 
-                println!("Getting the connection");
+                let _db: Box<DBKey> = unsafe { Box::from_raw(db_ptr) };
 
-                let _db: Box<db_connection> = unsafe { Box::from_raw(db_ptr) };
-
-                println!("Deleting the key");
                 unsafe {
-                    match ffi::RedisModule_DeleteKey {
-                        Some(f) => {
-                            if safe_key.key.is_null() {
-                                println!("The key is null");
-                            } else {
-                                println!("NOT NULL");
-                            }
-                            println!("Function is available!");
-                            match f(safe_key.key) {
-                                ffi::REDISMODULE_OK => {
-                                    println!("f returned ok");
-                                }
-                                ffi::REDISMODULE_ERR => {
-                                    println!("f returned error");
-                                }
-                                _ => {
-                                    println!("f returned something");
-                                }
-                            }
-                        }
-                        None => println!("The function is not available!"),
-                    }
-                };
+                    ffi::RedisModule_DeleteKey.unwrap()(safe_key.key);
+                }
 
-                println!("Send the message");
                 let ok = CString::new("OK").unwrap();
                 unsafe {
                     ffi::RedisModule_ReplyWithSimpleString.unwrap()(ctx, ok.as_ptr())
@@ -404,6 +173,28 @@ extern "C" fn DeleteDB(ctx: *mut ffi::RedisModuleCtx,
     }
 }
 
+
+enum Command {
+    Stop,
+    Exec {
+        query: String, /* client: ffi::RedisModuleBlockedClient,
+                        * db: Arc<sql::RawConnection>, */
+    },
+}
+
+fn listen_and_execute(db: sql::RawConnection, rx: Receiver<Command>) {
+    loop {
+        match rx.recv() {
+            Ok(Command::Exec { query }) => {
+                println!("Inside long running function receive query: {}",
+                         query)
+            }
+            Ok(Command::Stop) => return,
+            Err(RecvError) => return,
+        }
+    }
+}
+
 #[allow(non_snake_case)]
 extern "C" fn Exec(ctx: *mut ffi::RedisModuleCtx,
                    argv: *mut *mut ffi::RedisModuleString,
@@ -429,13 +220,28 @@ extern "C" fn Exec(ctx: *mut ffi::RedisModuleCtx,
                 println!("Get the type ok!");
 
                 let db_ptr = unsafe {
-                    ffi::RedisModule_ModuleTypeGetValue.unwrap()(safe_key.key) as *mut db_connection
+                    ffi::RedisModule_ModuleTypeGetValue.unwrap()(safe_key.key) as *mut DBKey
                 };
 
-                let db: Box<db_connection> = unsafe { Box::from_raw(db_ptr) };
+                let mut db: Box<DBKey> = unsafe { Box::from_raw(db_ptr) };
+
+                let ch = db.tx.clone();
+
+                let cmd = Command::Exec { query: argvector[2].clone() };
+
+                //               ch.send(cmd);
+
+                // return ffi::REDISMODULE_OK;
+/*
+                if db.db.is_null() {
+                    println!("Empty db!");
+                }
+*/
 
 
-                match create_statement(&db.connection, argvector[2].clone()) {
+
+
+                match sql::create_statement(&mut db.db, argvector[2].clone()) {
                     Ok(stmt) => {
 
 
@@ -443,25 +249,25 @@ extern "C" fn Exec(ctx: *mut ffi::RedisModuleCtx,
 
                         Box::into_raw(db);
 
-                        match execute_statement(stmt) {
+                        match sql::execute_statement(stmt) {
                             Ok(cursor) => {
                                 match cursor {
-                                    Cursor::OKCursor => {
+                                    sql::Cursor::OKCursor => {
                                         let ok = CString::new("OK").unwrap();
                                         unsafe {
                                             ffi::RedisModule_ReplyWithSimpleString.unwrap()(ctx, ok.as_ptr())
                                         }
                                     }
-                                    Cursor::DONECursor => {
+                                    sql::Cursor::DONECursor => {
                                         let done = CString::new("DONE")
                                             .unwrap();
                                         unsafe {
                                             ffi::RedisModule_ReplyWithSimpleString.unwrap()(ctx, done.as_ptr())
                                         }
                                     }
-                                    Cursor::RowsCursor { .. } => {
+                                    sql::Cursor::RowsCursor { .. } => {
                                         let result =
-                                            cursor.collect::<Vec<Vec<Entity>>>();
+                                            cursor.collect::<Vec<Vec<sql::Entity>>>();
                                         unsafe {
                                             ffi::RedisModule_ReplyWithArray.unwrap()(ctx, result.len() as i64);
                                         }
@@ -533,7 +339,11 @@ extern "C" fn Exec(ctx: *mut ffi::RedisModuleCtx,
             }
         }
     }
+}
 
+struct DBKey {
+    tx: Sender<Command>,
+    db: sql::RawConnection,
 }
 
 #[allow(non_snake_case)]
@@ -559,10 +369,22 @@ extern "C" fn CreateDB(ctx: *mut ffi::RedisModuleCtx,
 
                     println!("Open the empty key!");
 
-                    match open_connection(String::from(":memory:")) {
+                    match sql::open_connection(String::from(":memory:")) {
                         Ok(rc) => {
+
+                            let (tx, rx) = channel();
+                            let db = DBKey {
+                                tx: tx,
+                                db: rc.clone(),
+                            };
+                            /*
+                            thread::spawn(|| {
+                                listen_and_execute(rc, rx);
+                            });
+*/
+
                             println!("Open the database");
-                            let ptr = Box::into_raw(Box::new(rc));
+                            let ptr = Box::into_raw(Box::new(db));
                             let type_set = unsafe {
                                 ffi::RedisModule_ModuleTypeSetValue.unwrap()(safe_key.key, ffi::DBType, ptr as *mut std::os::raw::c_void)
                             };
