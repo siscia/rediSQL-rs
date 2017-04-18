@@ -39,11 +39,24 @@ fn main() {
     let bindings = bindgen::Builder::default()
         .no_unstable_rust()
         .parse_callbacks(Box::new(SqliteTypeChooser))
-        .header("wrapper.h")
+        .header("sqlite_dependencies.h")
         .generate()
         .expect("Unable to generate bindings");
 
     let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
-    bindings.write_to_file(out_path.join("bindings.rs"))
+    bindings.write_to_file(out_path.join("bindings_sqlite.rs"))
         .expect("Couldn't write bindings!");
+
+    let bindings = bindgen::Builder::default()
+        .no_unstable_rust()
+        .parse_callbacks(Box::new(SqliteTypeChooser))
+        .header("redis_dependencies.h")
+        .generate()
+        .expect("Unable to generate bindings");
+
+    let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
+    bindings.write_to_file(out_path.join("bindings_redis.rs"))
+        .expect("Couldn't write bindings!");
+
+
 }
